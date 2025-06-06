@@ -12,7 +12,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Inlin
 
 # Telegram bot token
 TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"
-run = True
+active_chats = set()
 
 # Setup logging
 logging.basicConfig(
@@ -223,8 +223,7 @@ async def monitor_changes_telegram(bot, chat_id, interval_seconds=60):
     global tracked_matches
     first_run = True
     async with aiohttp.ClientSession() as session:
-        global run
-        while run:
+        while chat_id in active_chats:
             try:
                 current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 logger.info(f"[{current_time_str}] Polling BangBet matches...")
@@ -286,33 +285,23 @@ async def monitor_changes_telegram(bot, chat_id, interval_seconds=60):
 # Telegram Handlers
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global run
-    run = True
     chat_id = update.effective_chat.id
+    if chat_id in active_chats:
+        await context.bot.send_message(chat_id, text="Odds are already being tracked")
+        return
+    
+    active_chats.add(chat_id)
     logger.info(f"/start command received in chat {chat_id}")
     await context.bot.send_message(chat_id=chat_id, text="Starting Odds monitor...")
     context.application.create_task(monitor_changes_telegram(context.bot, chat_id))
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global run
-    run = False
-    await context.bot.send_message(update.effective_chat.id, "Stopped sending updates")
-
-
-
-async def inline_caps(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.inline_query.query
-    if not query:
-        return
-
-    results = [
-        InlineQueryResultArticle(
-            id=str(uuid4()),
-            title='Caps',
-            input_message_content=InputTextMessageContent(query.upper())
-        )
-    ]
-    await context.bot.answer_inline_query(inline_query_id=update.inline_query.id, results=results)
+    chat_id = update.effective_chat.id
+    if chat_id in active_chats:
+        active_chats.remove(chat_id)
+        await context.bot.send_message(chat_id, "Updates are being stopped...")
+    else:
+        await context.bot.send_message(chat_id, "Your Odds aren't being tracked")
 
 
 # --- FastAPI HTTP Server for Render port binding ---
@@ -330,7 +319,6 @@ def start_telegram_bot():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('stop', stop))
-    app.add_handler(InlineQueryHandler(inline_caps))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
