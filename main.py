@@ -2,7 +2,8 @@ import logging
 import asyncio
 import aiohttp
 import threading
-from fastapi import FastAPI
+import os
+from fastapi import FastAPI, Request
 import uvicorn
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
@@ -12,6 +13,10 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Inlin
 
 # Telegram bot token
 TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"
+WEBHOOK_URL = "https://bet-scrapper-78du.onrender.com"  # Replace with your actual URL
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = 10000
+
 active_chats = set()
 
 # Setup logging
@@ -304,23 +309,57 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, "Your Odds aren't being tracked")
 
 
-# --- FastAPI HTTP Server for Render port binding ---
+# --- FastAPI HTTP Server with Webhook Support ---
 http_app = FastAPI()
 
 @http_app.get("/")
 async def root():
     return {"status": "BangBet Bot is alive"}
 
-def start_http_server():
-    uvicorn.run(http_app, host="0.0.0.0", port=10000)
+@http_app.post("/webhook")
+async def webhook(update: dict):
+    """Handle incoming Telegram updates via webhook"""
+    telegram_update = Update.de_json(update, bot)
+    await application.process_update(telegram_update)
+    return {"status": "ok"}
 
-def start_telegram_bot():
-    logger.info("Starting Telegram bot...")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('stop', stop))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+async def set_webhook():
+    """Configure the webhook with Telegram"""
+    async with aiohttp.ClientSession() as session:
+        webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
+        async with session.get(webhook_url) as response:
+            result = await response.json()
+            logger.info(f"Webhook setup result: {result}")
+            return result.get("ok", False)
+
+async def startup():
+    """Application startup tasks"""
+    if not await set_webhook():
+        logger.error("Failed to set webhook!")
+    else:
+        logger.info("Webhook successfully configured")
+
+def start_application():
+    """Start the FastAPI server and configure the bot"""
+    global bot, application
+    
+    # Build the Telegram application
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .post_init(startup)  # Set webhook on startup
+        .build()
+    )
+    
+    # Add handlers
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('stop', stop))
+    
+    # Store the bot instance for webhook handling
+    bot = application.bot
+    
+    # Start the web server
+    uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
 
 if __name__ == "__main__":
-    threading.Thread(target=start_http_server, daemon=True).start()
-    start_telegram_bot()
+    start_application()
