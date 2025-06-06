@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Configuration (with API keys inline as requested)
+# Configuration
 TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"
 WEBHOOK_URL = "https://bet-scrapper-78du.onrender.com/webhook"
 WEBAPP_HOST = "0.0.0.0"
@@ -41,6 +41,8 @@ BANGBET_PAYLOAD = {
 active_chats = set()
 tracked_matches = {}
 bot_application = None
+initialization_lock = asyncio.Lock()
+initialization_complete = False
 
 # Initialize logging
 logging.basicConfig(
@@ -52,7 +54,7 @@ logger = logging.getLogger(__name__)
 # FastAPI app
 http_app = FastAPI()
 
-# Helper functions
+# Helper functions (unchanged from your original)
 def format_odds_change_message(prev_odds, new_odds, home, away, tournament):
     labels = ["Home Win", "Draw", "Away Win"]
     changes = []
@@ -253,64 +255,91 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Bot initialization
 async def initialize_bot():
-    global bot_application
+    global bot_application, initialization_complete
     
-    bot_application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
-    
-    # Register handlers
-    bot_application.add_handler(CommandHandler("start", start))
-    bot_application.add_handler(CommandHandler("stop", stop))
-    
-    # Set webhook
-    async with aiohttp.ClientSession() as session:
-        url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
-        async with session.get(url) as response:
-            result = await response.json()
-            logger.info(f"Webhook setup result: {result}")
-            if not result.get('ok'):
-                raise RuntimeError(f"Failed to set webhook: {result.get('description')}")
+    async with initialization_lock:
+        if initialization_complete:
+            return
+            
+        logger.info("Initializing bot application...")
+        try:
+            bot_application = (
+                ApplicationBuilder()
+                .token(TOKEN)
+                .build()
+            )
+            
+            # Initialize the application properly
+            await bot_application.initialize()
+            
+            # Register handlers
+            bot_application.add_handler(CommandHandler("start", start))
+            bot_application.add_handler(CommandHandler("stop", stop))
+            
+            # Set webhook
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
+                async with session.get(url) as response:
+                    result = await response.json()
+                    logger.info(f"Webhook setup result: {result}")
+                    if not result.get('ok'):
+                        raise RuntimeError(f"Failed to set webhook: {result.get('description')}")
+            
+            initialization_complete = True
+            logger.info("Bot initialization complete")
+            
+        except Exception as e:
+            logger.error(f"Initialization failed: {e}")
+            raise
 
 # FastAPI endpoints
 @http_app.on_event("startup")
 async def startup_event():
     """Initialize the bot when FastAPI starts"""
-    await initialize_bot()
-    logger.info("Bot initialization complete")
+    try:
+        await initialize_bot()
+    except Exception as e:
+        logger.critical(f"Failed to initialize bot: {e}")
+        # Exit if initialization fails
+        raise
 
 @http_app.get("/")
 async def health_check():
     return {
         "status": "running",
+        "initialized": initialization_complete,
         "active_chats": len(active_chats),
-        "tracked_matches": len(tracked_matches),
-        "bot_initialized": bot_application is not None
+        "tracked_matches": len(tracked_matches)
     }
 
 @http_app.post("/webhook")
 async def handle_webhook(update: dict):
     """Handle incoming Telegram updates"""
-    if not bot_application:
-        logger.error("Bot application not initialized!")
-        raise HTTPException(status_code=503, detail="Service not ready")
-    
     try:
+        if not initialization_complete:
+            logger.warning("Received webhook before initialization complete")
+            await initialize_bot()
+            
+        if not bot_application:
+            logger.error("Bot application not available after initialization")
+            raise HTTPException(status_code=503, detail="Service not ready")
+        
         telegram_update = Update.de_json(update, bot_application.bot)
         await bot_application.process_update(telegram_update)
         return {"status": "ok"}
+    
     except Exception as e:
         logger.error(f"Error processing update: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     # Start the server
-    uvicorn.run(
+    config = uvicorn.Config(
         http_app,
         host=WEBAPP_HOST,
         port=WEBAPP_PORT,
         loop="asyncio",
         reload=False
     )
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())
