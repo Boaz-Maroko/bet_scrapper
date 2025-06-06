@@ -19,6 +19,8 @@ WEBAPP_PORT = 10000
 
 active_chats = set()
 
+application = None
+
 # Setup logging
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -319,16 +321,18 @@ async def root():
 @http_app.post("/webhook")
 async def handle_webhook(update: dict):
     try:
-        # Add logging to see incoming updates
         logger.info(f"Received update: {update}")
         
+        if application is None:
+            logger.error("Application not initialized!")
+            return {"status": "error", "detail": "Bot not ready"}, 503
+            
         telegram_update = Update.de_json(update, application.bot)
         await application.process_update(telegram_update)
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"Error processing update: {e}")
         return {"status": "error", "detail": str(e)}, 500
-
 async def set_webhook():
     try:
         async with aiohttp.ClientSession() as session:
@@ -344,11 +348,19 @@ async def set_webhook():
         return False
     
 async def startup():
-    """Application startup tasks"""
-    if not await set_webhook():
-        logger.error("Failed to set webhook!")
-    else:
-        logger.info("Webhook successfully configured")
+    global application
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+    
+    # Add handlers
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('stop', stop))
+    
+    # Set webhook
+    await set_webhook()
 
 def start_application():
     """Start the FastAPI server and configure the bot"""
@@ -373,4 +385,9 @@ def start_application():
     uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
 
 if __name__ == "__main__":
-    start_application()
+    # Run startup first
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(startup())
+    
+    # Then start the web server
+    uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
