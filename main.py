@@ -1,43 +1,42 @@
 import logging
 import asyncio
 import aiohttp
-import threading
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 import uvicorn
-from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 
-from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, InlineQueryHandler
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Telegram bot token
-TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"
-WEBHOOK_URL = "https://bet-scrapper-78du.onrender.com"  # Replace with your actual URL
+# Configuration
+TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"  # Always use environment variables for secrets
+WEBHOOK_URL = "https://bet-scrapper-78du.onrender.com/webhook"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = 10000
 
+# Globals
 active_chats = set()
-
 application = None
+tracked_matches = {}  # match_id -> dict
 
-# Setup logging
+# Logging setup
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO 
 )
 logger = logging.getLogger(__name__)
 
-# BangBet API setup
-url = "https://bet-api.bangbet.com/api/bet/match/list"
-headers = {
+# BangBet API configuration
+BANGBET_API_URL = "https://bet-api.bangbet.com/api/bet/match/list"
+BANGBET_HEADERS = {
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0",
     "Origin": "https://www.bangbet.com",
     "Referer": "https://www.bangbet.com/",
 }
 
-base_payload = {
+BANGBET_PAYLOAD = {
     "sportId": "sr:sport:1",
     "groupIndex": "0",
     "producer": 3,
@@ -53,28 +52,18 @@ base_payload = {
     "dataGroup": False
 }
 
-tracked_matches = {}  # match_id -> dict
-
-
+# Helper functions
 def format_odds_change_message(prev_odds, new_odds, home, away, tournament):
     labels = ["Home Win", "Draw", "Away Win"]
     changes = []
     for i, (prev, new) in enumerate(zip(prev_odds, new_odds)):
-        if new > prev:
-            arrow = "⬆️"
-        elif new < prev:
-            arrow = "⬇️"
-        else:
-            arrow = "➡️"
+        arrow = "⬆️" if new > prev else "⬇️" if new < prev else "➡️"
         changes.append(f"{labels[i]}: {prev} {arrow} {new}")
-
-    changes_str = '\n'.join(changes)
     return (
         f"⚽️ Odds Update: {home} vs {away}\n"
         f"🏆 Tournament: {tournament}\n"
-        f"{changes_str}"
+        f"{'\n'.join(changes)}"
     )
-
 
 def format_over_under_changes(prev_ou, new_ou):
     changes = []
@@ -82,20 +71,14 @@ def format_over_under_changes(prev_ou, new_ou):
         new = new_ou.get(total)
         prev = prev_ou.get(total) if prev_ou else None
         if not prev or prev != new:
-            arrows = []
-            for i in range(2):
-                if not prev:
-                    arrow = "🆕"
-                elif new[i] > prev[i]:
-                    arrow = "⬆️"
-                elif new[i] < prev[i]:
-                    arrow = "⬇️"
-                else:
-                    arrow = "➡️"
-                arrows.append(arrow)
+            arrows = [
+                "🆕" if not prev else 
+                "⬆️" if new[i] > prev[i] else 
+                "⬇️" if new[i] < prev[i] else "➡️" 
+                for i in range(2)
+            ]
             changes.append(f"O/U {total}: Over {new[0]} {arrows[0]} | Under {new[1]} {arrows[1]}")
     return "\n".join(changes)
-
 
 async def fetch_over_under_odds(session, match_id):
     try:
@@ -109,244 +92,197 @@ async def fetch_over_under_odds(session, match_id):
             "country": "ke"
         }
 
-        async with session.post(ou_url, headers=headers, json=payload) as response:
+        async with session.post(ou_url, headers=BANGBET_HEADERS, json=payload) as response:
             if response.status != 200:
-                logger.warning(f"Failed to fetch O/U odds for match {match_id} (status {response.status})")
+                logger.warning(f"Failed to fetch O/U odds (status {response.status})")
                 return {}
 
             data = await response.json()
-            markets = data["data"]["marketList"]
-
             ou_odds = {}
-            for market in markets:
+            for market in data["data"]["marketList"]:
                 if market["name"] == "Over/Under":
                     for sub_market in market["markets"]:
-                        spec = sub_market.get("specifiers", "")
-                        if spec.startswith("total="):
+                        if spec := sub_market.get("specifiers", "").startswith("total="):
                             try:
                                 total = float(spec.split("=")[1].replace("&", ""))
-                                if 0.5 <= total <= 5.5:
-                                    outcomes = sub_market.get("outcomes", [])
-                                    if len(outcomes) == 2:
-                                        over = outcomes[0]["odds"]
-                                        under = outcomes[1]["odds"]
-                                        ou_odds[total] = (over, under)
+                                if 0.5 <= total <= 5.5 and len(sub_market.get("outcomes", [])) == 2:
+                                    ou_odds[total] = (sub_market["outcomes"][0]["odds"], 
+                                                     sub_market["outcomes"][1]["odds"])
                             except Exception as e:
-                                logger.error(f"Failed to parse total in specifier: {spec} — {e}")
+                                logger.error(f"Error parsing specifier: {e}")
             return ou_odds
     except Exception as e:
-        logger.exception(f"Exception while fetching O/U odds for match {match_id}")
+        logger.error(f"Exception fetching O/U odds: {e}")
         return {}
 
-
 async def fetch_all_matches_async():
-    page = 1
-    matches_data = {}
-
+    page, matches_data = 1, {}
     async with aiohttp.ClientSession() as session:
         while True:
             logger.info(f"Fetching match list (page {page})")
-            payload = base_payload.copy()
-            payload["page"] = page
-            payload["pageNo"] = page
+            payload = BANGBET_PAYLOAD.copy()
+            payload.update({"page": page, "pageNo": page})
 
-            async with session.post(url, headers=headers, json=payload) as response:
+            async with session.post(BANGBET_API_URL, headers=BANGBET_HEADERS, json=payload) as response:
                 if response.status != 200:
-                    logger.error(f"Failed to fetch match list (status {response.status})")
+                    logger.error(f"Failed to fetch matches (status {response.status})")
                     break
 
                 try:
                     data = await response.json()
-                    matches = data["data"]["data"]
+                    if not (matches := data["data"]["data"]):
+                        logger.info("No more matches found")
+                        break
+
+                    EAT = timezone(timedelta(hours=3))
+                    now = datetime.now(EAT)
+                    
+                    for match in matches:
+                        try:
+                            if not (scheduled_time_ms := match.get("scheduledTime")):
+                                continue
+                                
+                            scheduled_datetime = datetime.fromtimestamp(scheduled_time_ms / 1000, tz=EAT)
+                            if scheduled_datetime.date() != now.date():
+                                continue
+
+                            if not (one_x_two := next(
+                                (m for group in match.get("marketList", []) 
+                                 for m in group.get("markets", []) 
+                                 if m.get("name") == "1x2"), None)):
+                                continue
+
+                            if len(one_x_two.get("outcomes", [])) < 3:
+                                continue
+
+                            home, draw, away = (one_x_two["outcomes"][i]["odds"] for i in range(3))
+                            if None in (home, draw, away):
+                                continue
+
+                            matches_data[match["id"]] = {
+                                "tournament": match.get("tournamentName", "Unknown"),
+                                "home": match.get("homeTeamName", "Home"),
+                                "away": match.get("awayTeamName", "Away"),
+                                "lastUpdateTime": match.get("lastUpdateTime", 0),
+                                "odds": (home, draw, away)
+                            }
+                        except KeyError as e:
+                            logger.error(f"KeyError processing match: {e}")
+                            continue
+
+                    page += 1
                 except Exception as e:
-                    logger.error(f"Failed to parse match list JSON: {e}")
+                    logger.error(f"Error parsing match data: {e}")
                     break
-
-                if not matches:
-                    logger.info("No more matches found.")
-                    break
-
-                for match in matches:
-                    try:
-                        match_id = match["id"]
-                        last_update = match.get("lastUpdateTime", 0)
-                        scheduled_time_ms = match.get("scheduledTime")
-                        if not scheduled_time_ms:
-                            continue  # skip if missing
-
-                        EAT = timezone(timedelta(hours=3))
-                        now = datetime.now(EAT)
-                        scheduled_datetime = datetime.fromtimestamp(scheduled_time_ms / 1000, tz=EAT)
-                        if scheduled_datetime.date() != now.date():
-                            continue  # skip matches not scheduled for today
-                        tournament = match.get("tournamentName", "Unknown Tournament")
-                        home = match.get("homeTeamName", "Home")
-                        away = match.get("awayTeamName", "Away")
-
-                        market_list = match.get("marketList", [])
-                        one_x_two_market = None
-                        for group in market_list:
-                            for market in group.get("markets", []):
-                                if market.get("name") == "1x2":
-                                    one_x_two_market = market
-                                    break
-                            if one_x_two_market:
-                                break
-
-                        if not one_x_two_market:
-                            logger.debug(f"Skipping match {match_id}: No 1X2 market")
-                            continue
-
-                        outcomes = one_x_two_market.get("outcomes", [])
-                        if len(outcomes) < 3:
-                            logger.debug(f"Skipping match {match_id}: Incomplete 1X2 odds")
-                            continue
-
-                        home_odds = outcomes[0].get("odds")
-                        draw_odds = outcomes[1].get("odds")
-                        away_odds = outcomes[2].get("odds")
-
-                        if None in (home_odds, draw_odds, away_odds):
-                            logger.debug(f"Skipping match {match_id}: Missing odds")
-                            continue
-
-                        matches_data[match_id] = {
-                            "tournament": tournament,
-                            "home": home,
-                            "away": away,
-                            "lastUpdateTime": last_update,
-                            "odds": (home_odds, draw_odds, away_odds)
-                        }
-                    except KeyError as e:
-                        logger.error(f"KeyError processing match: {e}")
-                        continue
-
-                page += 1
 
     return matches_data
 
-
-async def monitor_changes_telegram(bot, chat_id, interval_seconds=60):
+async def monitor_changes_telegram(bot, chat_id, interval=60):
     global tracked_matches
     first_run = True
+    
     async with aiohttp.ClientSession() as session:
         while chat_id in active_chats:
             try:
-                current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                logger.info(f"[{current_time_str}] Polling BangBet matches...")
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 current_matches = await fetch_all_matches_async()
-                logger.info(f"Fetched {len(current_matches)} matches")
-
-                changes_found = False
-                messages = []
-
+                
                 if first_run:
-                    await bot.send_message(chat_id=chat_id, text=f"[{current_time_str}] Monitoring started. Tracking {len(current_matches)} matches.")
-                    # Optionally, send a short summary or the first odds snapshot here.
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"[{current_time}] Monitoring started. Tracking {len(current_matches)} matches."
+                    )
                     first_run = False
 
+                messages = []
                 for match_id, info in current_matches.items():
-                    ou_odds = await fetch_over_under_odds(session, match_id)
-                    info["ou_odds"] = ou_odds
-
-                    prev = tracked_matches.get(match_id)
-                    if prev:
-                        if info["lastUpdateTime"] == prev["lastUpdateTime"] and info["odds"] == prev["odds"] and info["ou_odds"] == prev["ou_odds"]:
-                            continue
-
-                        if info["odds"] != prev["odds"] or info["ou_odds"] != prev.get("ou_odds"):
-                            changes_found = True
-                            msg = format_odds_change_message(
-                                prev["odds"], info["odds"],
-                                info["home"], info["away"], info["tournament"]
-                            )
-
-                            ou_change = format_over_under_changes(prev.get("ou_odds", {}), info["ou_odds"])
-                            if ou_change:
-                                msg += "\n\n📊 Over/Under Odds:\n" + ou_change
-
-                            messages.append(msg)
+                    info["ou_odds"] = await fetch_over_under_odds(session, match_id)
+                    
+                    if (prev := tracked_matches.get(match_id)) and (
+                        info["odds"] != prev["odds"] or 
+                        info["ou_odds"] != prev.get("ou_odds")
+                    ):
+                        msg = format_odds_change_message(
+                            prev["odds"], info["odds"],
+                            info["home"], info["away"], info["tournament"]
+                        )
+                        
+                        if ou_change := format_over_under_changes(prev.get("ou_odds", {}), info["ou_odds"]):
+                            msg += f"\n\n📊 Over/Under Odds:\n{ou_change}"
+                        
+                        messages.append(msg)
 
                     tracked_matches[match_id] = info
 
-                if not changes_found and not first_run:
-                    try:
-                        await bot.send_message(chat_id=chat_id, text=f"[{current_time_str}] No odds changed.")
-                        logger.info(f"[{current_time_str}] No odds changed message sent.")
-                    except Exception as e:
-                        logger.error(f"Failed to send 'no odds changed' message: {e}")
+                if not messages and not first_run:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"[{current_time}] No odds changed."
+                    )
                 else:
                     for msg in messages:
-                        try:
-                            await bot.send_message(chat_id=chat_id, text=f"[{current_time_str}]\n{msg}")
-                            logger.info("Sent odds change message.")
-                        except Exception as e:
-                            logger.error(f"Failed to send odds change message: {e}")
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"[{current_time}]\n{msg}"
+                        )
 
-                await asyncio.sleep(interval_seconds)
+                await asyncio.sleep(interval)
             except Exception as e:
-                logger.error(f"Error in monitor loop: {e}")
-                await asyncio.sleep(interval_seconds)
+                logger.error(f"Monitoring error: {e}")
+                await asyncio.sleep(interval)
 
-
-# Telegram Handlers
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# Telegram command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in active_chats:
-        await context.bot.send_message(chat_id, text="Odds are already being tracked")
+        await context.bot.send_message(chat_id, "Odds are already being tracked")
         return
     
     active_chats.add(chat_id)
-    logger.info(f"/start command received in chat {chat_id}")
-    await context.bot.send_message(chat_id=chat_id, text="Starting Odds monitor...")
-    context.application.create_task(monitor_changes_telegram(context.bot, chat_id))
+    await context.bot.send_message(chat_id, "Starting Odds monitor...")
+    asyncio.create_task(monitor_changes_telegram(context.bot, chat_id))
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in active_chats:
         active_chats.remove(chat_id)
-        await context.bot.send_message(chat_id, "Updates are being stopped...")
+        await context.bot.send_message(chat_id, "Updates stopped")
     else:
-        await context.bot.send_message(chat_id, "Your Odds aren't being tracked")
+        await context.bot.send_message(chat_id, "No active tracking")
 
+# Webhook setup
+async def set_webhook():
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}&drop_pending_updates=true"
+        async with session.get(url) as response:
+            result = await response.json()
+            logger.info(f"Webhook setup: {result}")
+            return result.get("ok", False)
 
-# --- FastAPI HTTP Server with Webhook Support ---
+# FastAPI app
 http_app = FastAPI()
 
 @http_app.get("/")
-async def root():
-    return {"status": "BangBet Bot is alive"}
+async def health_check():
+    return {
+        "status": "running",
+        "active_chats": len(active_chats),
+        "tracked_matches": len(tracked_matches)
+    }
 
 @http_app.post("/webhook")
 async def handle_webhook(update: dict):
     try:
-        logger.info(f"Received update: {update}")
-        
-        if application is None:
-            logger.error("Application not initialized!")
-            return {"status": "error", "detail": "Bot not ready"}, 503
+        if not application:
+            logger.error("Application not initialized")
+            return {"status": "error"}, 503
             
-        telegram_update = Update.de_json(update, application.bot)
-        await application.process_update(telegram_update)
+        await application.process_update(Update.de_json(update, application.bot))
         return {"status": "ok"}
     except Exception as e:
-        logger.error(f"Error processing update: {e}")
+        logger.error(f"Webhook error: {e}")
         return {"status": "error", "detail": str(e)}, 500
-async def set_webhook():
-    try:
-        async with aiohttp.ClientSession() as session:
-            webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
-            async with session.get(webhook_url) as response:
-                result = await response.json()
-                logger.info(f"Webhook setup result: {result}")
-                if not result.get('ok'):
-                    logger.error(f"Webhook setup failed: {result.get('description')}")
-                return result.get("ok", False)
-    except Exception as e:
-        logger.error(f"Exception setting webhook: {e}")
-        return False
-    
+
 async def startup():
     global application
     application = (
@@ -355,39 +291,18 @@ async def startup():
         .build()
     )
     
-    # Add handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('stop', stop))
     
-    # Set webhook
-    await set_webhook()
-
-def start_application():
-    """Start the FastAPI server and configure the bot"""
-    global bot, application
-    
-    # Build the Telegram application
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .post_init(startup)  # Set webhook on startup
-        .build()
-    )
-    
-    # Add handlers
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('stop', stop))
-    
-    # Store the bot instance for webhook handling
-    bot = application.bot
-    
-    # Start the web server
-    uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    if not await set_webhook():
+        raise RuntimeError("Failed to set webhook")
 
 if __name__ == "__main__":
-    # Run startup first
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(startup())
-    
-    # Then start the web server
-    uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    try:
+        loop.run_until_complete(startup())
+        uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
+    except Exception as e:
+        logger.error(f"Failed to start: {e}")
+    finally:
+        loop.close()
