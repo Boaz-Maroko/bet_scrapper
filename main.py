@@ -58,10 +58,11 @@ def format_odds_change_message(prev_odds, new_odds, home, away, tournament):
             arrow = "➡️"
         changes.append(f"{labels[i]}: {prev} {arrow} {new}")
 
+    changes_str = '\n'.join(changes)
     return (
         f"⚽️ Odds Update: {home} vs {away}\n"
         f"🏆 Tournament: {tournament}\n"
-        f"{'\n'.join(changes)}"
+        f"{changes_str}"
     )
 
 
