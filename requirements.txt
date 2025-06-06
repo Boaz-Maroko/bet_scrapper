@@ -1,2 +1,4 @@
 aiohttp==3.12.9
+fastapi==0.115.12
 python-telegram-bot==22.1
+uvicorn==0.34.3
