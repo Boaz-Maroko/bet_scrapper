@@ -1,6 +1,9 @@
 import logging
 import asyncio
 import aiohttp
+import threading
+from fastapi import FastAPI
+import uvicorn
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 
@@ -312,10 +315,24 @@ async def inline_caps(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.answer_inline_query(inline_query_id=update.inline_query.id, results=results)
 
 
-if __name__ == "__main__":
-    logger.info("Bot is starting...")
+# --- FastAPI HTTP Server for Render port binding ---
+http_app = FastAPI()
+
+@http_app.get("/")
+async def root():
+    return {"status": "BangBet Bot is alive"}
+
+def start_http_server():
+    uvicorn.run(http_app, host="0.0.0.0", port=10000)
+
+def start_telegram_bot():
+    logger.info("Starting Telegram bot...")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('stop', stop))
     app.add_handler(InlineQueryHandler(inline_caps))
-    app.run_polling(5)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    threading.Thread(target=start_http_server, daemon=True).start()
+    start_telegram_bot()
