@@ -1,33 +1,19 @@
 import logging
 import asyncio
 import aiohttp
-import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import uvicorn
 from datetime import datetime, timezone, timedelta
-
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# Configuration
-TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"  # Always use environment variables for secrets
+# Configuration (with API keys inline as requested)
+TOKEN = "7598759444:AAHdQzzORYT06ZM-JBduzmfEqTVFoLtjCBg"
 WEBHOOK_URL = "https://bet-scrapper-78du.onrender.com/webhook"
 WEBAPP_HOST = "0.0.0.0"
 WEBAPP_PORT = 10000
 
-# Globals
-active_chats = set()
-application = None
-tracked_matches = {}  # match_id -> dict
-
-# Logging setup
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO 
-)
-logger = logging.getLogger(__name__)
-
-# BangBet API configuration
+# API Configuration
 BANGBET_API_URL = "https://bet-api.bangbet.com/api/bet/match/list"
 BANGBET_HEADERS = {
     "Content-Type": "application/json",
@@ -35,7 +21,6 @@ BANGBET_HEADERS = {
     "Origin": "https://www.bangbet.com",
     "Referer": "https://www.bangbet.com/",
 }
-
 BANGBET_PAYLOAD = {
     "sportId": "sr:sport:1",
     "groupIndex": "0",
@@ -52,6 +37,21 @@ BANGBET_PAYLOAD = {
     "dataGroup": False
 }
 
+# Global state
+active_chats = set()
+tracked_matches = {}
+bot_application = None
+
+# Initialize logging
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# FastAPI app
+http_app = FastAPI()
+
 # Helper functions
 def format_odds_change_message(prev_odds, new_odds, home, away, tournament):
     labels = ["Home Win", "Draw", "Away Win"]
@@ -59,11 +59,10 @@ def format_odds_change_message(prev_odds, new_odds, home, away, tournament):
     for i, (prev, new) in enumerate(zip(prev_odds, new_odds)):
         arrow = "⬆️" if new > prev else "⬇️" if new < prev else "➡️"
         changes.append(f"{labels[i]}: {prev} {arrow} {new}")
-    changes_string = "\n".join(changes)
     return (
         f"⚽️ Odds Update: {home} vs {away}\n"
         f"🏆 Tournament: {tournament}\n"
-        f"{changes_string}"
+        f"{'\n'.join(changes)}"
     )
 
 def format_over_under_changes(prev_ou, new_ou):
@@ -251,59 +250,66 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(chat_id, "No active tracking")
 
-# Webhook setup
-async def set_webhook():
+# Bot initialization
+async def initialize_bot():
+    global bot_application
+    
+    bot_application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+    
+    # Register handlers
+    bot_application.add_handler(CommandHandler("start", start))
+    bot_application.add_handler(CommandHandler("stop", stop))
+    
+    # Set webhook
     async with aiohttp.ClientSession() as session:
-        url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}&drop_pending_updates=true"
+        url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
         async with session.get(url) as response:
             result = await response.json()
-            logger.info(f"Webhook setup: {result}")
-            return result.get("ok", False)
+            logger.info(f"Webhook setup result: {result}")
+            if not result.get('ok'):
+                raise RuntimeError(f"Failed to set webhook: {result.get('description')}")
 
-# FastAPI app
-http_app = FastAPI()
+# FastAPI endpoints
+@http_app.on_event("startup")
+async def startup_event():
+    """Initialize the bot when FastAPI starts"""
+    await initialize_bot()
+    logger.info("Bot initialization complete")
 
 @http_app.get("/")
 async def health_check():
     return {
         "status": "running",
         "active_chats": len(active_chats),
-        "tracked_matches": len(tracked_matches)
+        "tracked_matches": len(tracked_matches),
+        "bot_initialized": bot_application is not None
     }
 
 @http_app.post("/webhook")
 async def handle_webhook(update: dict):
+    """Handle incoming Telegram updates"""
+    if not bot_application:
+        logger.error("Bot application not initialized!")
+        raise HTTPException(status_code=503, detail="Service not ready")
+    
     try:
-        if not application:
-            logger.error("Application not initialized")
-            return {"status": "error"}, 503
-            
-        await application.process_update(Update.de_json(update, application.bot))
+        telegram_update = Update.de_json(update, bot_application.bot)
+        await bot_application.process_update(telegram_update)
         return {"status": "ok"}
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return {"status": "error", "detail": str(e)}, 500
-
-async def startup():
-    global application
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .build()
-    )
-    
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('stop', stop))
-    
-    if not await set_webhook():
-        raise RuntimeError("Failed to set webhook")
+        logger.error(f"Error processing update: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(startup())
-        uvicorn.run(http_app, host=WEBAPP_HOST, port=WEBAPP_PORT)
-    except Exception as e:
-        logger.error(f"Failed to start: {e}")
-    finally:
-        loop.close()
+    # Start the server
+    uvicorn.run(
+        http_app,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+        loop="asyncio",
+        reload=False
+    )
