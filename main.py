@@ -317,21 +317,32 @@ async def root():
     return {"status": "BangBet Bot is alive"}
 
 @http_app.post("/webhook")
-async def webhook(update: dict):
-    """Handle incoming Telegram updates via webhook"""
-    telegram_update = Update.de_json(update, bot)
-    await application.process_update(telegram_update)
-    return {"status": "ok"}
+async def handle_webhook(update: dict):
+    try:
+        # Add logging to see incoming updates
+        logger.info(f"Received update: {update}")
+        
+        telegram_update = Update.de_json(update, application.bot)
+        await application.process_update(telegram_update)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Error processing update: {e}")
+        return {"status": "error", "detail": str(e)}, 500
 
 async def set_webhook():
-    """Configure the webhook with Telegram"""
-    async with aiohttp.ClientSession() as session:
-        webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
-        async with session.get(webhook_url) as response:
-            result = await response.json()
-            logger.info(f"Webhook setup result: {result}")
-            return result.get("ok", False)
-
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook_url = f"https://api.telegram.org/bot{TOKEN}/setWebhook?url={WEBHOOK_URL}"
+            async with session.get(webhook_url) as response:
+                result = await response.json()
+                logger.info(f"Webhook setup result: {result}")
+                if not result.get('ok'):
+                    logger.error(f"Webhook setup failed: {result.get('description')}")
+                return result.get("ok", False)
+    except Exception as e:
+        logger.error(f"Exception setting webhook: {e}")
+        return False
+    
 async def startup():
     """Application startup tasks"""
     if not await set_webhook():
